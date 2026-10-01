@@ -2,7 +2,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use gpui::{
     WindowId,
-    profiler::{FrameTiming, FrameTimingCollector},
+    profiler::{FrameEvent, FrameTimingCollector},
 };
 use web_time::Instant;
 
@@ -49,12 +49,8 @@ impl FrameSampler {
     /// Drains the frames drawn since the previous call. Call once per rendered
     /// frame.
     pub(crate) fn tick(&mut self) {
-        let timings = self
-            .collector
-            .collect_unseen()
-            .into_iter()
-            .collect();
-        self.ingest(timings, Instant::now());
+        let events = self.collector.collect_unseen();
+        self.ingest(events, Instant::now());
     }
 
     pub(crate) fn set_capacity(&mut self, capacity: usize) {
@@ -162,8 +158,13 @@ impl FrameSampler {
             .unwrap_or_default()
     }
 
-    fn ingest(&mut self, timings: Vec<FrameTiming>, now: Instant) {
-        for timing in timings {
+    /// Records each drawn frame of this window. The trace also reports when a
+    /// frame is presented; those events are skipped so each frame counts once.
+    fn ingest(&mut self, events: Vec<FrameEvent>, now: Instant) {
+        for event in events {
+            let FrameEvent::Draw(timing) = event else {
+                continue;
+            };
             if timing.window_id != self.window_id {
                 continue;
             }
@@ -382,24 +383,36 @@ pub(crate) fn minimum_resource_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::profiler::{FrameTiming, PresentTiming};
 
     // GPUI stamps frames with `scheduler::Instant`, which re-exports
     // `std::time::Instant` off the web, so tests can build one without pulling
     // in the `scheduler` crate.
-    fn timing(window_id: WindowId, draw: Duration) -> FrameTiming {
+    fn timing(window_id: WindowId, draw: Duration) -> FrameEvent {
         coalesced(window_id, draw, 1)
     }
 
     /// A frame that answered `invalidations` requests to redraw at once.
-    fn coalesced(window_id: WindowId, draw: Duration, invalidations: u64) -> FrameTiming {
+    fn coalesced(window_id: WindowId, draw: Duration, invalidations: u64) -> FrameEvent {
         let start = std::time::Instant::now();
-        FrameTiming {
+        FrameEvent::Draw(FrameTiming {
             window_id,
             dirty_at: None,
             invalidations,
             draw_start: start,
             draw_end: start + draw,
-        }
+        })
+    }
+
+    /// The trace's record of a frame reaching the screen, after its draw.
+    fn presented(window_id: WindowId) -> FrameEvent {
+        let start = std::time::Instant::now();
+        FrameEvent::Present(PresentTiming {
+            window_id,
+            present_start: start,
+            present_end: start + Duration::from_millis(1),
+            animation_interval: None,
+        })
     }
 
     /// A sampler holding one frame per entry in `draws`, in milliseconds.
@@ -431,6 +444,26 @@ mod tests {
 
         assert_eq!(sampler.samples().len(), 2);
         assert_eq!(sampler.peak_draw(), Duration::from_millis(9));
+    }
+
+    #[test]
+    fn counts_a_presented_frame_once() {
+        let window_id = WindowId::from(1);
+        let mut sampler = FrameSampler::new(window_id, 8);
+        let now = Instant::now();
+
+        sampler.ingest(
+            vec![
+                timing(window_id, Duration::from_millis(8)),
+                presented(window_id),
+                timing(window_id, Duration::from_millis(9)),
+                presented(window_id),
+            ],
+            now,
+        );
+
+        assert_eq!(sampler.samples().len(), 2);
+        assert_eq!(sampler.frame_times.len(), 2);
     }
 
     #[test]
